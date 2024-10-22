@@ -21,6 +21,17 @@ except (ImportError, RuntimeError, OSError):
     scaled_dot_product_attention = None
     SDPA_AVAILABLE = False
 
+def quantize(tensor, bit):
+    factor = pow(2, bit) - 1
+    min_val, max_val = tensor.min(), tensor.max()
+    scale = (max_val - min_val) / factor
+    zero_point = min_val
+    quantized = ((tensor - zero_point) / scale).round().clamp(0, factor).to(torch.int8)
+    return quantized, scale, zero_point
+
+def dequantize(tensor, scale, zero_point):
+    return tensor.to(torch.half) * scale + zero_point
+
 
 @dataclass
 class ModelDimensions:
@@ -42,6 +53,16 @@ class LayerNorm(nn.LayerNorm):
 
 
 class Linear(nn.Linear):
+    def forward_with_dequantization(self, x: Tensor) -> Tensor:
+        # Dequantize the weights before the forward pass
+        dequantized_weights = dequantize(*self.quant_predictor)
+        #linear_layer.weight.data = dequantized_weights
+        return F.linear(
+            x,
+            dequantized_weights.to(x.dtype),
+            None if self.bias is None else self.bias.to(x.dtype),
+        )
+
     def forward(self, x: Tensor) -> Tensor:
         return F.linear(
             x,
@@ -140,11 +161,13 @@ class MultiHeadAttention(nn.Module):
 
 
 class ResidualAttentionBlock(nn.Module):
-    def __init__(self, n_state: int, n_head: int, cross_attention: bool = False):
+    def __init__(self, n_state: int, n_head: int, cross_attention: bool = False, 
+                 mlp_on: bool = False, quant_on: bool = False, layer_id: int = 0):
         super().__init__()
 
         self.attn = MultiHeadAttention(n_state, n_head)
         self.attn_ln = LayerNorm(n_state)
+        self.layer_id = layer_id
 
         self.cross_attn = (
             MultiHeadAttention(n_state, n_head) if cross_attention else None
@@ -157,17 +180,56 @@ class ResidualAttentionBlock(nn.Module):
         )
         self.mlp_ln = LayerNorm(n_state)
 
+        self.mlp_on = mlp_on
+        self.quant_on = quant_on
+
     def forward(
         self,
         x: Tensor,
         xa: Optional[Tensor] = None,
         mask: Optional[Tensor] = None,
         kv_cache: Optional[dict] = None,
+        mlp = None,
     ):
         x = x + self.attn(self.attn_ln(x), mask=mask, kv_cache=kv_cache)[0]
         if self.cross_attn:
             x = x + self.cross_attn(self.cross_attn_ln(x), xa, kv_cache=kv_cache)[0]
-        x = x + self.mlp(self.mlp_ln(x))
+
+        temp = self.mlp_ln(x)
+        mlp_map = [0.6] * 5 + [0.6] * 5 + [0.6] * 5 + [0.6] * 5 + [0.6] * 4
+        mlp_map = [0.4] * 24
+        thr = mlp_map[self.layer_id]
+
+        # apply predictors
+        pred = None
+        if self.mlp_on:
+            mlp_pred = torch.relu(x @ self.mlp_fc1.T.half()) @ self.mlp_fc2.T.half()
+            mlp_pred = torch.sigmoid(mlp_pred)
+            mlp_pred = (mlp_pred > thr).int()
+            pred = mlp_pred
+
+        if self.quant_on:
+            quant_pred = self.mlp[0].forward_with_dequantization(temp).float()
+            percentile = torch.quantile(quant_pred, 0.8).item()
+            quant_pred = (quant_pred > percentile).int()
+            pred = quant_pred
+
+        if self.mlp_on and self.quant_on:
+            pred = quant_pred | mlp_pred
+
+        # original MM
+        temp = self.mlp[0](temp)        # Linear
+        temp = self.mlp[1](temp) # GELU
+
+        if pred is not None:
+            temp = self.mlp[2](temp * pred)        # Linear
+        else:
+            temp = self.mlp[2](temp)
+
+        x = x + temp
+
+        #else:
+        #    x = x + self.mlp(self.mlp_ln(x))
         return x
 
 
@@ -215,8 +277,11 @@ class TextDecoder(nn.Module):
 
         self.blocks: Iterable[ResidualAttentionBlock] = nn.ModuleList(
             [
-                ResidualAttentionBlock(n_state, n_head, cross_attention=True)
-                for _ in range(n_layer)
+                #ResidualAttentionBlock(n_state, n_head, cross_attention=True)
+                ResidualAttentionBlock(n_state, n_head, cross_attention=True, mlp_on=True, layer_id=i)
+                #ResidualAttentionBlock(n_state, n_head, cross_attention=True, quant_on=True, layer_id=i)
+                #ResidualAttentionBlock(n_state, n_head, cross_attention=True, mlp_on=True, quant_on=True, layer_id=i)
+                for i in range(n_layer)
             ]
         )
         self.ln = LayerNorm(n_state)
@@ -274,6 +339,18 @@ class Whisper(nn.Module):
         )
         all_heads[self.dims.n_text_layer // 2 :] = True
         self.register_buffer("alignment_heads", all_heads.to_sparse(), persistent=False)
+
+    def set_mlp_predictor(self):
+        for i, block in enumerate(self.decoder.blocks):
+            block.mlp_fc1 = self.mlp_pred[f"decoder.blocks.{i}.mlp_fc1.weight"]
+            block.mlp_fc2 = self.mlp_pred[f"decoder.blocks.{i}.mlp_fc2.weight"]
+        print("MLP updated")
+
+    def set_quant_predictor(self, bit):
+        for i, block in enumerate(self.decoder.blocks):
+            quantized, scale, zero_point = quantize(block.mlp[0].weight.data, bit)
+            block.mlp[0].quant_predictor = (quantized, scale, zero_point)
+        print("Quant predictor updated")
 
     def set_alignment_heads(self, dump: bytes):
         array = np.frombuffer(

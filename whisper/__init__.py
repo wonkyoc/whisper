@@ -105,6 +105,7 @@ def load_model(
     device: Optional[Union[str, torch.device]] = None,
     download_root: str = None,
     in_memory: bool = False,
+    mlp_on: bool = False,
 ) -> Whisper:
     """
     Load a Whisper ASR model
@@ -152,7 +153,12 @@ def load_model(
 
     dims = ModelDimensions(**checkpoint["dims"])
     model = Whisper(dims)
+   
     model.load_state_dict(checkpoint["model_state_dict"])
+
+    if mlp_on:
+        print("MLP predictors are on")
+        model.mlp_pred = torch.load(f"/home/bfr4xr/whisper/scripts/whisper_medium_decoder_ffn_mlp.pth")
 
     if alignment_heads is not None:
         model.set_alignment_heads(alignment_heads)
